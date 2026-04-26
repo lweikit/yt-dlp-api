@@ -276,8 +276,19 @@ def search_olevod(q: str):
         data = _olevod_decrypt(data)
     if not data:
         return []
+    items = []
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        for group in data.get("data", []):
+            if isinstance(group, dict):
+                for entry in (group.get("list") or []):
+                    if isinstance(entry, dict):
+                        items.append(entry)
+        if not items:
+            items = data.get("records", [])
     results = []
-    for item in (data if isinstance(data, list) else data.get("records", [])):
+    for item in items:
         vid = item.get("id")
         if not vid:
             continue
@@ -286,7 +297,7 @@ def search_olevod(q: str):
             "name": item.get("name"),
             "type": item.get("typeId1Name"),
             "year": item.get("year"),
-            "episodes": item.get("episodesTxt"),
+            "episodes": item.get("remarks") or item.get("episodesTxt"),
             "url": f"{OLEVOD_SITE}/detail/{vid}.html",
         })
     return results
