@@ -20,7 +20,7 @@ jobs: dict[str, dict] = {}
 
 SONARR_URL = os.environ.get("SONARR_URL", "http://localhost:8989")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
-SONARR_TAG = os.environ.get("SONARR_TAG", "tvb")
+ARR_TAG = os.environ.get("ARR_TAG", "yt-dlp")
 RADARR_URL = os.environ.get("RADARR_URL", "http://localhost:7878")
 RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/downloads/yt-dlp")
@@ -66,9 +66,9 @@ def _radarr_post(path: str, body: dict):
     return _arr_post(RADARR_URL, RADARR_API_KEY, path, body)
 
 
-def _get_tvb_tag_id() -> int | None:
-    for tag in _sonarr_get("tag"):
-        if tag["label"] == SONARR_TAG:
+def _get_tag_id(get_fn) -> int | None:
+    for tag in get_fn("tag"):
+        if tag["label"] == ARR_TAG:
             return tag["id"]
     return None
 
@@ -235,11 +235,11 @@ def start_download(req: DownloadRequest):
 
 
 @app.get("/series")
-def list_tvb_series():
-    """List all Sonarr series tagged with the tvb tag."""
+def list_tagged_series():
+    """List all Sonarr series tagged with ARR_TAG."""
     if not SONARR_API_KEY:
         raise HTTPException(status_code=500, detail="SONARR_API_KEY not configured")
-    tag_id = _get_tvb_tag_id()
+    tag_id = _get_tag_id(_sonarr_get)
     if tag_id is None:
         return []
     all_series = _sonarr_get("series")
@@ -254,6 +254,27 @@ def list_tvb_series():
             "missing": s.get("episodeCount", 0) - s.get("episodeFileCount", 0),
         }
         for s in all_series if tag_id in s.get("tags", [])
+    ]
+
+
+@app.get("/movies")
+def list_tagged_movies():
+    """List all Radarr movies tagged with ARR_TAG."""
+    if not RADARR_API_KEY:
+        raise HTTPException(status_code=500, detail="RADARR_API_KEY not configured")
+    tag_id = _get_tag_id(_radarr_get)
+    if tag_id is None:
+        return []
+    all_movies = _radarr_get("movie")
+    return [
+        {
+            "id": m["id"],
+            "title": m["title"],
+            "year": m.get("year"),
+            "path": m["path"],
+            "hasFile": m.get("hasFile", False),
+        }
+        for m in all_movies if tag_id in m.get("tags", [])
     ]
 
 
