@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import json as json_mod
 import os
 import threading
 import time
@@ -9,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 
 import yt_dlp
+from yt_dlp.aes import aes_cbc_decrypt_bytes, unpad_pkcs7
 
 app = FastAPI(title="yt-dlp API", version="0.1.0")
 
@@ -212,6 +216,80 @@ def list_jobs():
         jid: {"status": j["status"], "url": j["url"], "title": j["title"]}
         for jid, j in jobs.items()
     }
+
+
+def _olevod_vv():
+    ts = str(int(time.time()))
+    bits = ['', '', '', '']
+    for char in ts:
+        encoded = format(ord(char), 'b')
+        bits[0] += encoded[2:3]
+        bits[1] += encoded[3:4]
+        bits[2] += encoded[4:5]
+        bits[3] += encoded[5:]
+    inserts = []
+    for part in bits:
+        value = format(int(part, 2), 'x') if part else ''
+        value = value.zfill(3)
+        inserts.append(value)
+    digest = hashlib.md5(ts.encode()).hexdigest()
+    return ''.join((
+        digest[:3], inserts[0], digest[6:11], inserts[1],
+        digest[14:19], inserts[2], digest[22:27], inserts[3], digest[30:],
+    ))
+
+
+def _olevod_decrypt(data: str):
+    if not isinstance(data, str):
+        return data
+    now = int(time.time())
+    for offset in (0, 86400, -86400):
+        date_str = time.strftime('%Y-%m-%d', time.localtime(now + offset))
+        key = hashlib.md5(date_str.encode()).hexdigest()[8:24].encode()
+        try:
+            decrypted = unpad_pkcs7(aes_cbc_decrypt_bytes(base64.b64decode(data), key, key)).decode()
+            return json_mod.loads(decrypted)
+        except Exception:
+            continue
+    return None
+
+
+OLEVOD_API = "https://api.olelive.com"
+OLEVOD_SITE = "https://www.olevod.com"
+
+
+@app.get("/search/olevod")
+def search_olevod(q: str):
+    headers = {"Origin": OLEVOD_SITE, "Referer": f"{OLEVOD_SITE}/"}
+    resp = httpx.get(
+        f"{OLEVOD_API}/v1/pub/index/search/{q}/0/0/0/1",
+        params={"_vv": _olevod_vv()},
+        headers=headers,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("code") != 0:
+        return []
+    data = body.get("data")
+    if isinstance(data, str):
+        data = _olevod_decrypt(data)
+    if not data:
+        return []
+    results = []
+    for item in (data if isinstance(data, list) else data.get("records", [])):
+        vid = item.get("id")
+        if not vid:
+            continue
+        results.append({
+            "id": vid,
+            "name": item.get("name"),
+            "type": item.get("typeId1Name"),
+            "year": item.get("year"),
+            "episodes": item.get("episodesTxt"),
+            "url": f"{OLEVOD_SITE}/detail/{vid}.html",
+        })
+    return results
 
 
 @app.get("/health")
