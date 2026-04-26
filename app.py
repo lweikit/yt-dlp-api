@@ -17,6 +17,7 @@ jobs: dict[str, dict] = {}
 SONARR_URL = os.environ.get("SONARR_URL", "http://localhost:8989")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/downloads/yt-dlp")
+SONARR_DOWNLOAD_DIR = os.environ.get("SONARR_DOWNLOAD_DIR", "")
 
 
 class DownloadRequest(BaseModel):
@@ -37,12 +38,19 @@ def _build_outtmpl(show_dir: Path, show_name: str | None, season: int) -> str:
     return str(show_dir / f"{name} - S{season:02d}E%(episode_number)02d.%(ext)s")
 
 
+def _sonarr_path(container_path: str) -> str:
+    if SONARR_DOWNLOAD_DIR:
+        return container_path.replace(DOWNLOAD_DIR, SONARR_DOWNLOAD_DIR, 1)
+    return container_path
+
+
 def _notify_sonarr(scan_path: str):
     if not SONARR_API_KEY:
         return {"skipped": "no SONARR_API_KEY configured"}
+    sonarr_scan_path = _sonarr_path(scan_path)
     resp = httpx.post(
         f"{SONARR_URL}/api/v3/command",
-        json={"name": "DownloadedEpisodesScan", "path": scan_path},
+        json={"name": "DownloadedEpisodesScan", "path": sonarr_scan_path},
         headers={"X-Api-Key": SONARR_API_KEY},
         timeout=30,
     )

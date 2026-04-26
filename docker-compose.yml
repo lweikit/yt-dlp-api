@@ -8,6 +8,7 @@ services:
       - SONARR_URL=http://192.168.216.10:30113
       - SONARR_API_KEY=${SONARR_API_KEY}
       - DOWNLOAD_DIR=/downloads/yt-dlp
+      - SONARR_DOWNLOAD_DIR=/downloads/complete/yt-dlp
     volumes:
       - /mnt/nexus/downloads/complete:/downloads
       - /mnt/nexus/media:/media
