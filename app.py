@@ -18,6 +18,8 @@ SONARR_URL = os.environ.get("SONARR_URL", "http://localhost:8989")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/downloads/yt-dlp")
 SONARR_DOWNLOAD_DIR = os.environ.get("SONARR_DOWNLOAD_DIR", "")
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+RETRY_DELAY = int(os.environ.get("RETRY_DELAY", "30"))
 
 
 class DownloadRequest(BaseModel):
@@ -79,33 +81,48 @@ def _run_download(job_id: str, url: str, show_name: str | None, season: int, fmt
         "no_warnings": True,
     }
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            resolved_name = show_name or info.get("series") or info.get("title") or "Unknown"
-            job["title"] = resolved_name
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            job["attempt"] = attempt
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                resolved_name = show_name or info.get("series") or info.get("title") or "Unknown"
+                job["title"] = resolved_name
 
-            if not show_name and resolved_name != "unknown":
-                final_dir = Path(DOWNLOAD_DIR) / resolved_name
-                if show_dir != final_dir:
-                    show_dir.rename(final_dir)
-                    show_dir = final_dir
+                if not show_name and resolved_name != "unknown":
+                    final_dir = Path(DOWNLOAD_DIR) / resolved_name
+                    if show_dir != final_dir:
+                        show_dir.rename(final_dir)
+                        show_dir = final_dir
 
-            job["total_entries"] = info.get("n_entries")
-            job["download_path"] = str(show_dir)
+                job["total_entries"] = info.get("n_entries")
+                job["download_path"] = str(show_dir)
 
-        if notify:
-            try:
-                job["sonarr"] = _notify_sonarr(str(show_dir))
-            except Exception as e:
-                job["sonarr"] = {"error": str(e)}
+            if notify:
+                try:
+                    job["sonarr"] = _notify_sonarr(str(show_dir))
+                except Exception as e:
+                    job["sonarr"] = {"error": str(e)}
 
-        job["status"] = "completed"
-        job["finished_at"] = time.time()
-    except Exception as e:
-        job["status"] = "failed"
-        job["error"] = str(e)
-        job["finished_at"] = time.time()
+            job["status"] = "completed"
+            job["finished_at"] = time.time()
+            return
+        except Exception as e:
+            last_error = e
+            is_transient = any(s in str(e).lower() for s in [
+                "name resolution", "connection", "timeout", "temporary failure",
+                "network", "reset by peer", "broken pipe",
+            ])
+            if is_transient and attempt < MAX_RETRIES:
+                job["status"] = f"retrying ({attempt}/{MAX_RETRIES})"
+                time.sleep(RETRY_DELAY * attempt)
+                continue
+            break
+
+    job["status"] = "failed"
+    job["error"] = str(last_error)
+    job["finished_at"] = time.time()
 
 
 @app.post("/download", response_model=JobResponse)
