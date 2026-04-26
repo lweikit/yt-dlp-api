@@ -1,0 +1,9 @@
+services:
+  yt-dlp-api:
+    build: .
+    container_name: yt-dlp-api
+    ports:
+      - "30191:8191"
+    volumes:
+      - /mnt/pool/media:/media
+    restart: unless-stopped
