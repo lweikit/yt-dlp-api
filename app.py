@@ -16,43 +16,15 @@ jobs: dict[str, dict] = {}
 
 SONARR_URL = os.environ.get("SONARR_URL", "http://localhost:8989")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
-DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/downloads/yt-dlp")
-SONARR_DOWNLOAD_DIR = os.environ.get("SONARR_DOWNLOAD_DIR", "")
+SONARR_TAG = os.environ.get("SONARR_TAG", "tvb")
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 RETRY_DELAY = int(os.environ.get("RETRY_DELAY", "30"))
 
 
-class DownloadRequest(BaseModel):
-    url: HttpUrl
-    show_name: str | None = None
-    season: int = 1
-    format: str = "bestvideo+bestaudio/best"
-    notify_sonarr: bool = True
-
-
-class JobResponse(BaseModel):
-    job_id: str
-    status: str
-
-
-def _build_outtmpl(show_dir: Path, show_name: str | None, season: int) -> str:
-    name = show_name or "%(series,title)s"
-    return str(show_dir / f"{name} - S{season:02d}E%(episode_number)02d.%(ext)s")
-
-
-def _sonarr_path(container_path: str) -> str:
-    if SONARR_DOWNLOAD_DIR:
-        return container_path.replace(DOWNLOAD_DIR, SONARR_DOWNLOAD_DIR, 1)
-    return container_path
-
-
-def _notify_sonarr(scan_path: str):
-    if not SONARR_API_KEY:
-        return {"skipped": "no SONARR_API_KEY configured"}
-    sonarr_scan_path = _sonarr_path(scan_path)
-    resp = httpx.post(
-        f"{SONARR_URL}/api/v3/command",
-        json={"name": "DownloadedEpisodesScan", "path": sonarr_scan_path},
+def _sonarr_get(path: str, params: dict | None = None):
+    resp = httpx.get(
+        f"{SONARR_URL}/api/v3/{path}",
+        params=params,
         headers={"X-Api-Key": SONARR_API_KEY},
         timeout=30,
     )
@@ -60,11 +32,63 @@ def _notify_sonarr(scan_path: str):
     return resp.json()
 
 
-def _run_download(job_id: str, url: str, show_name: str | None, season: int, fmt: str, notify: bool):
+def _sonarr_post(path: str, body: dict):
+    resp = httpx.post(
+        f"{SONARR_URL}/api/v3/{path}",
+        json=body,
+        headers={"X-Api-Key": SONARR_API_KEY},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_tvb_tag_id() -> int | None:
+    for tag in _sonarr_get("tag"):
+        if tag["label"] == SONARR_TAG:
+            return tag["id"]
+    return None
+
+
+class DownloadRequest(BaseModel):
+    url: HttpUrl
+    show_name: str | None = None
+    season: int = 1
+    sonarr_series_id: int | None = None
+    format: str = "bestvideo+bestaudio/best"
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+def _build_outtmpl(series_path: str, series_title: str, season: int) -> str:
+    season_dir = Path(series_path) / f"Season {season:02d}"
+    season_dir.mkdir(parents=True, exist_ok=True)
+    return str(season_dir / f"{series_title} - S{season:02d}E%(episode_number)02d.%(ext)s")
+
+
+def _run_download(job_id: str, url: str, show_name: str | None, season: int,
+                  sonarr_series_id: int | None, fmt: str):
     job = jobs[job_id]
 
-    show_dir = Path(DOWNLOAD_DIR) / (show_name or "unknown")
-    show_dir.mkdir(parents=True, exist_ok=True)
+    series_path = None
+    series_title = show_name or "Unknown"
+
+    if sonarr_series_id and SONARR_API_KEY:
+        try:
+            series = _sonarr_get(f"series/{sonarr_series_id}")
+            series_path = series["path"]
+            series_title = series["title"]
+            job["sonarr_series"] = series_title
+        except Exception as e:
+            job["sonarr"] = {"error": f"Failed to get series: {e}"}
+
+    if not series_path:
+        series_path = f"/tv/{series_title}"
+
+    outtmpl = _build_outtmpl(series_path, series_title, season)
 
     def progress_hook(d):
         if d["status"] == "downloading":
@@ -75,7 +99,7 @@ def _run_download(job_id: str, url: str, show_name: str | None, season: int, fmt
 
     opts = {
         "format": fmt,
-        "outtmpl": _build_outtmpl(show_dir, show_name, season),
+        "outtmpl": outtmpl,
         "progress_hooks": [progress_hook],
         "quiet": True,
         "no_warnings": True,
@@ -87,21 +111,16 @@ def _run_download(job_id: str, url: str, show_name: str | None, season: int, fmt
             job["attempt"] = attempt
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                resolved_name = show_name or info.get("series") or info.get("title") or "Unknown"
-                job["title"] = resolved_name
-
-                if not show_name and resolved_name != "unknown":
-                    final_dir = Path(DOWNLOAD_DIR) / resolved_name
-                    if show_dir != final_dir:
-                        show_dir.rename(final_dir)
-                        show_dir = final_dir
-
+                job["title"] = info.get("title") or info.get("series") or series_title
                 job["total_entries"] = info.get("n_entries")
-                job["download_path"] = str(show_dir)
+                job["download_path"] = series_path
 
-            if notify:
+            if sonarr_series_id and SONARR_API_KEY:
                 try:
-                    job["sonarr"] = _notify_sonarr(str(show_dir))
+                    job["sonarr"] = _sonarr_post("command", {
+                        "name": "RescanSeries",
+                        "seriesId": sonarr_series_id,
+                    })
                 except Exception as e:
                     job["sonarr"] = {"error": str(e)}
 
@@ -133,6 +152,8 @@ def start_download(req: DownloadRequest):
         "url": str(req.url),
         "show_name": req.show_name,
         "season": req.season,
+        "sonarr_series_id": req.sonarr_series_id,
+        "sonarr_series": None,
         "progress": "0%",
         "filename": "",
         "downloaded_files": [],
@@ -146,11 +167,35 @@ def start_download(req: DownloadRequest):
     }
     thread = threading.Thread(
         target=_run_download,
-        args=(job_id, str(req.url), req.show_name, req.season, req.format, req.notify_sonarr),
+        args=(job_id, str(req.url), req.show_name, req.season,
+              req.sonarr_series_id, req.format),
         daemon=True,
     )
     thread.start()
     return JobResponse(job_id=job_id, status="downloading")
+
+
+@app.get("/series")
+def list_tvb_series():
+    """List all Sonarr series tagged with the tvb tag."""
+    if not SONARR_API_KEY:
+        raise HTTPException(status_code=500, detail="SONARR_API_KEY not configured")
+    tag_id = _get_tvb_tag_id()
+    if tag_id is None:
+        return []
+    all_series = _sonarr_get("series")
+    return [
+        {
+            "id": s["id"],
+            "title": s["title"],
+            "path": s["path"],
+            "seasons": len(s["seasons"]),
+            "episodeCount": s.get("episodeCount", 0),
+            "episodeFileCount": s.get("episodeFileCount", 0),
+            "missing": s.get("episodeCount", 0) - s.get("episodeFileCount", 0),
+        }
+        for s in all_series if tag_id in s.get("tags", [])
+    ]
 
 
 @app.get("/status/{job_id}")
