@@ -1,4 +1,4 @@
-yt-dlp @ git+https://github.com/lweikit/yt-dlp.git@master
+yt-dlp
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 httpx>=0.28.0
