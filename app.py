@@ -16,6 +16,8 @@ jobs: dict[str, dict] = {}
 class DownloadRequest(BaseModel):
     url: HttpUrl
     output_dir: str = "/media/tvb"
+    show_name: str | None = None
+    season: int = 1
     format: str = "bestvideo+bestaudio/best"
 
 
@@ -24,7 +26,13 @@ class JobResponse(BaseModel):
     status: str
 
 
-def _run_download(job_id: str, url: str, output_dir: str, fmt: str):
+def _build_outtmpl(output_dir: str, show_name: str | None, season: int) -> str:
+    if show_name:
+        return str(Path(output_dir) / show_name / f"Season {season:02d}" / f"{show_name} - S{season:02d}E%(episode_number)02d.%(ext)s")
+    return str(Path(output_dir) / "%(series,title)s" / f"Season {season:02d}" / f"%(series,title)s - S{season:02d}E%(episode_number)02d.%(ext)s")
+
+
+def _run_download(job_id: str, url: str, output_dir: str, show_name: str | None, season: int, fmt: str):
     job = jobs[job_id]
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -38,7 +46,7 @@ def _run_download(job_id: str, url: str, output_dir: str, fmt: str):
 
     opts = {
         "format": fmt,
-        "outtmpl": str(output_path / "%(series,title)s/%(series,title)s_%(episode,title)s.%(ext)s"),
+        "outtmpl": _build_outtmpl(output_dir, show_name, season),
         "progress_hooks": [progress_hook],
         "quiet": True,
         "no_warnings": True,
@@ -64,6 +72,8 @@ def start_download(req: DownloadRequest):
         "status": "downloading",
         "url": str(req.url),
         "output_dir": req.output_dir,
+        "show_name": req.show_name,
+        "season": req.season,
         "progress": "0%",
         "filename": "",
         "downloaded_files": [],
@@ -75,7 +85,7 @@ def start_download(req: DownloadRequest):
     }
     thread = threading.Thread(
         target=_run_download,
-        args=(job_id, str(req.url), req.output_dir, req.format),
+        args=(job_id, str(req.url), req.output_dir, req.show_name, req.season, req.format),
         daemon=True,
     )
     thread.start()
