@@ -20,7 +20,7 @@ jobs: dict[str, dict] = {}
 
 SONARR_URL = os.environ.get("SONARR_URL", "http://localhost:8989")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
-ARR_TAG = os.environ.get("ARR_TAG", "yt-dlp")
+ARR_TAG = os.environ.get("ARR_TAG", "tvb")
 RADARR_URL = os.environ.get("RADARR_URL", "http://localhost:7878")
 RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/downloads/yt-dlp")
