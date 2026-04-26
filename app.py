@@ -14,37 +14,56 @@ from pydantic import BaseModel, HttpUrl
 import yt_dlp
 from yt_dlp.aes import aes_cbc_decrypt_bytes, unpad_pkcs7
 
-app = FastAPI(title="yt-dlp API", version="0.1.0")
+app = FastAPI(title="yt-dlp API", version="0.2.0")
 
 jobs: dict[str, dict] = {}
 
 SONARR_URL = os.environ.get("SONARR_URL", "http://localhost:8989")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
 SONARR_TAG = os.environ.get("SONARR_TAG", "tvb")
+RADARR_URL = os.environ.get("RADARR_URL", "http://localhost:7878")
+RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "")
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/downloads/yt-dlp")
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 RETRY_DELAY = int(os.environ.get("RETRY_DELAY", "30"))
 
 
-def _sonarr_get(path: str, params: dict | None = None):
+def _arr_get(base_url: str, api_key: str, path: str, params: dict | None = None):
     resp = httpx.get(
-        f"{SONARR_URL}/api/v3/{path}",
+        f"{base_url}/api/v3/{path}",
         params=params,
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers={"X-Api-Key": api_key},
         timeout=30,
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _arr_post(base_url: str, api_key: str, path: str, body: dict):
+    resp = httpx.post(
+        f"{base_url}/api/v3/{path}",
+        json=body,
+        headers={"X-Api-Key": api_key},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _sonarr_get(path: str, params: dict | None = None):
+    return _arr_get(SONARR_URL, SONARR_API_KEY, path, params)
 
 
 def _sonarr_post(path: str, body: dict):
-    resp = httpx.post(
-        f"{SONARR_URL}/api/v3/{path}",
-        json=body,
-        headers={"X-Api-Key": SONARR_API_KEY},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _arr_post(SONARR_URL, SONARR_API_KEY, path, body)
+
+
+def _radarr_get(path: str, params: dict | None = None):
+    return _arr_get(RADARR_URL, RADARR_API_KEY, path, params)
+
+
+def _radarr_post(path: str, body: dict):
+    return _arr_post(RADARR_URL, RADARR_API_KEY, path, body)
 
 
 def _get_tvb_tag_id() -> int | None:
@@ -59,6 +78,7 @@ class DownloadRequest(BaseModel):
     show_name: str | None = None
     season: int = 1
     sonarr_series_id: int | None = None
+    radarr_movie_id: int | None = None
     format: str = "bestvideo+bestaudio/best"
 
 
@@ -67,32 +87,57 @@ class JobResponse(BaseModel):
     status: str
 
 
-def _build_outtmpl(series_path: str, series_title: str, season: int) -> str:
+def _build_series_outtmpl(series_path: str, series_title: str, season: int) -> str:
     season_dir = Path(series_path) / f"Season {season:02d}"
     season_dir.mkdir(parents=True, exist_ok=True)
     return str(season_dir / f"{series_title} - S{season:02d}E%(episode_number)02d.%(ext)s")
 
 
+def _build_movie_outtmpl(movie_path: str) -> str:
+    movie_dir = Path(movie_path)
+    movie_dir.mkdir(parents=True, exist_ok=True)
+    return str(movie_dir / "%(title)s.%(ext)s")
+
+
+def _build_generic_outtmpl(name: str) -> str:
+    dl_dir = Path(DOWNLOAD_DIR) / name
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    return str(dl_dir / "%(title)s.%(ext)s")
+
+
 def _run_download(job_id: str, url: str, show_name: str | None, season: int,
-                  sonarr_series_id: int | None, fmt: str):
+                  sonarr_series_id: int | None, radarr_movie_id: int | None, fmt: str):
     job = jobs[job_id]
 
-    series_path = None
-    series_title = show_name or "Unknown"
+    outtmpl = None
+    download_path = None
+    media_title = show_name or "Unknown"
 
     if sonarr_series_id and SONARR_API_KEY:
         try:
             series = _sonarr_get(f"series/{sonarr_series_id}")
             series_path = series["path"]
-            series_title = series["title"]
-            job["sonarr_series"] = series_title
+            media_title = series["title"]
+            job["sonarr_series"] = media_title
+            outtmpl = _build_series_outtmpl(series_path, media_title, season)
+            download_path = series_path
         except Exception as e:
-            job["sonarr"] = {"error": f"Failed to get series: {e}"}
+            job["arr_result"] = {"error": f"Failed to get series: {e}"}
 
-    if not series_path:
-        series_path = f"/tv/{series_title}"
+    elif radarr_movie_id and RADARR_API_KEY:
+        try:
+            movie = _radarr_get(f"movie/{radarr_movie_id}")
+            movie_path = movie["path"]
+            media_title = movie["title"]
+            job["radarr_movie"] = media_title
+            outtmpl = _build_movie_outtmpl(movie_path)
+            download_path = movie_path
+        except Exception as e:
+            job["arr_result"] = {"error": f"Failed to get movie: {e}"}
 
-    outtmpl = _build_outtmpl(series_path, series_title, season)
+    if not outtmpl:
+        outtmpl = _build_generic_outtmpl(media_title)
+        download_path = str(Path(DOWNLOAD_DIR) / media_title)
 
     def progress_hook(d):
         if d["status"] == "downloading":
@@ -115,18 +160,26 @@ def _run_download(job_id: str, url: str, show_name: str | None, season: int,
             job["attempt"] = attempt
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                job["title"] = info.get("title") or info.get("series") or series_title
+                job["title"] = info.get("title") or info.get("series") or media_title
                 job["total_entries"] = info.get("n_entries")
-                job["download_path"] = series_path
+                job["download_path"] = download_path
 
             if sonarr_series_id and SONARR_API_KEY:
                 try:
-                    job["sonarr"] = _sonarr_post("command", {
+                    job["arr_result"] = _sonarr_post("command", {
                         "name": "RescanSeries",
                         "seriesId": sonarr_series_id,
                     })
                 except Exception as e:
-                    job["sonarr"] = {"error": str(e)}
+                    job["arr_result"] = {"error": str(e)}
+            elif radarr_movie_id and RADARR_API_KEY:
+                try:
+                    job["arr_result"] = _radarr_post("command", {
+                        "name": "RescanMovie",
+                        "movieId": radarr_movie_id,
+                    })
+                except Exception as e:
+                    job["arr_result"] = {"error": str(e)}
 
             job["status"] = "completed"
             job["finished_at"] = time.time()
@@ -157,14 +210,16 @@ def start_download(req: DownloadRequest):
         "show_name": req.show_name,
         "season": req.season,
         "sonarr_series_id": req.sonarr_series_id,
+        "radarr_movie_id": req.radarr_movie_id,
         "sonarr_series": None,
+        "radarr_movie": None,
         "progress": "0%",
         "filename": "",
         "downloaded_files": [],
         "title": None,
         "total_entries": None,
         "download_path": None,
-        "sonarr": None,
+        "arr_result": None,
         "error": None,
         "started_at": time.time(),
         "finished_at": None,
@@ -172,7 +227,7 @@ def start_download(req: DownloadRequest):
     thread = threading.Thread(
         target=_run_download,
         args=(job_id, str(req.url), req.show_name, req.season,
-              req.sonarr_series_id, req.format),
+              req.sonarr_series_id, req.radarr_movie_id, req.format),
         daemon=True,
     )
     thread.start()
