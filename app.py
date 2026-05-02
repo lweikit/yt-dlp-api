@@ -80,6 +80,8 @@ class DownloadRequest(BaseModel):
     sonarr_series_id: int | None = None
     radarr_movie_id: int | None = None
     format: str = "bestvideo+bestaudio/best"
+    force: bool = False
+    episodes: list[int] | None = None
 
 
 class JobResponse(BaseModel):
@@ -106,7 +108,8 @@ def _build_generic_outtmpl(name: str) -> str:
 
 
 def _run_download(job_id: str, url: str, show_name: str | None, season: int,
-                  sonarr_series_id: int | None, radarr_movie_id: int | None, fmt: str):
+                  sonarr_series_id: int | None, radarr_movie_id: int | None,
+                  fmt: str, force: bool = False, episodes: list[int] | None = None):
     job = jobs[job_id]
 
     outtmpl = None
@@ -153,6 +156,11 @@ def _run_download(job_id: str, url: str, show_name: str | None, season: int,
         "quiet": True,
         "no_warnings": True,
     }
+    if force:
+        opts["overwrites"] = True
+    if episodes:
+        ep_set = set(episodes)
+        opts["match_filter"] = lambda info, *_: None if info.get("episode_number") in ep_set else "episode filtered out"
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -227,7 +235,8 @@ def start_download(req: DownloadRequest):
     thread = threading.Thread(
         target=_run_download,
         args=(job_id, str(req.url), req.show_name, req.season,
-              req.sonarr_series_id, req.radarr_movie_id, req.format),
+              req.sonarr_series_id, req.radarr_movie_id, req.format,
+              req.force, req.episodes),
         daemon=True,
     )
     thread.start()
