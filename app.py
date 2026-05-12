@@ -13,6 +13,7 @@ from pydantic import BaseModel, HttpUrl
 
 import yt_dlp
 from yt_dlp.aes import aes_cbc_decrypt_bytes, unpad_pkcs7
+from youtube_transcript_api import YouTubeTranscriptApi
 
 app = FastAPI(title="yt-dlp API", version="0.2.0")
 
@@ -300,6 +301,40 @@ def list_jobs():
     return {
         jid: {"status": j["status"], "url": j["url"], "title": j["title"]}
         for jid, j in jobs.items()
+    }
+
+
+@app.get("/transcript")
+def get_transcript(url: str, lang: str = "en"):
+    """Fetch YouTube video transcript as plain text or timed segments."""
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(url)
+    video_id = parse_qs(parsed.query).get("v", [None])[0]
+    if not video_id:
+        path = parsed.path.lstrip("/")
+        if path:
+            video_id = path.split("/")[-1]
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Could not extract video ID from URL")
+
+    try:
+        ytt = YouTubeTranscriptApi()
+        transcript = ytt.fetch(video_id, languages=[lang])
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    segments = [
+        {"text": s.text, "start": s.start, "duration": s.duration}
+        for s in transcript
+    ]
+    text = " ".join(s.text for s in transcript)
+
+    return {
+        "video_id": video_id,
+        "language": lang,
+        "text": text,
+        "segments": segments,
     }
 
 
