@@ -1,7 +1,5 @@
-import base64
-import hashlib
-import json as json_mod
 import os
+import queue
 import threading
 import time
 import uuid
@@ -12,10 +10,16 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 
 import yt_dlp
-from yt_dlp.aes import aes_cbc_decrypt_bytes, unpad_pkcs7
 from youtube_transcript_api import YouTubeTranscriptApi
 
-app = FastAPI(title="yt-dlp API", version="0.2.0")
+# Shared with the yt-dlp extractor plugin. In the image the plugins dir is copied
+# to yt_dlp_plugins/extractor/; locally it lives at plugins/.
+try:
+    from yt_dlp_plugins.extractor.olevod_common import decrypt_api_data, make_vv
+except ImportError:
+    from plugins.olevod_common import decrypt_api_data, make_vv
+
+app = FastAPI(title="yt-dlp API", version="0.3.0")
 
 jobs: dict[str, dict] = {}
 
@@ -27,6 +31,45 @@ RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/downloads/yt-dlp")
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 RETRY_DELAY = int(os.environ.get("RETRY_DELAY", "30"))
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
+# Finished jobs older than this (seconds) are pruned from memory; 0 disables.
+JOB_RETENTION = int(os.environ.get("JOB_RETENTION", "86400"))
+
+job_queue: "queue.Queue[str]" = queue.Queue()
+
+
+def _prune_jobs():
+    if JOB_RETENTION <= 0:
+        return
+    cutoff = time.time() - JOB_RETENTION
+    for jid, v in list(jobs.items()):
+        if v.get("finished_at") and v["finished_at"] < cutoff:
+            jobs.pop(jid, None)
+
+
+def _worker():
+    while True:
+        job_id = job_queue.get()
+        try:
+            job = jobs.get(job_id)
+            if job:
+                _run_download(
+                    job_id, job["url"], job["show_name"], job["season"],
+                    job["sonarr_series_id"], job["radarr_movie_id"],
+                    job["format"], job["force"], job["episodes"],
+                )
+        except Exception as e:  # safety net: never let a worker thread die
+            if job_id in jobs:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["error"] = str(e)
+                jobs[job_id]["finished_at"] = time.time()
+        finally:
+            _prune_jobs()
+            job_queue.task_done()
+
+
+for _ in range(MAX_CONCURRENT_DOWNLOADS):
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _arr_get(base_url: str, api_key: str, path: str, params: dict | None = None):
@@ -112,6 +155,8 @@ def _run_download(job_id: str, url: str, show_name: str | None, season: int,
                   sonarr_series_id: int | None, radarr_movie_id: int | None,
                   fmt: str, force: bool = False, episodes: list[int] | None = None):
     job = jobs[job_id]
+    job["status"] = "downloading"
+    job["started_at"] = time.time()
 
     outtmpl = None
     download_path = None
@@ -212,14 +257,23 @@ def _run_download(job_id: str, url: str, show_name: str | None, season: int,
 
 @app.post("/download", response_model=JobResponse)
 def start_download(req: DownloadRequest):
+    if req.sonarr_series_id and req.radarr_movie_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide only one of sonarr_series_id or radarr_movie_id",
+        )
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {
-        "status": "downloading",
+        "status": "queued",
+        "attempt": 0,
         "url": str(req.url),
         "show_name": req.show_name,
         "season": req.season,
         "sonarr_series_id": req.sonarr_series_id,
         "radarr_movie_id": req.radarr_movie_id,
+        "format": req.format,
+        "force": req.force,
+        "episodes": req.episodes,
         "sonarr_series": None,
         "radarr_movie": None,
         "progress": "0%",
@@ -230,18 +284,12 @@ def start_download(req: DownloadRequest):
         "download_path": None,
         "arr_result": None,
         "error": None,
-        "started_at": time.time(),
+        "queued_at": time.time(),
+        "started_at": None,
         "finished_at": None,
     }
-    thread = threading.Thread(
-        target=_run_download,
-        args=(job_id, str(req.url), req.show_name, req.season,
-              req.sonarr_series_id, req.radarr_movie_id, req.format,
-              req.force, req.episodes),
-        daemon=True,
-    )
-    thread.start()
-    return JobResponse(job_id=job_id, status="downloading")
+    job_queue.put(job_id)
+    return JobResponse(job_id=job_id, status="queued")
 
 
 @app.get("/series")
@@ -300,8 +348,20 @@ def get_status(job_id: str):
 def list_jobs():
     return {
         jid: {"status": j["status"], "url": j["url"], "title": j["title"]}
-        for jid, j in jobs.items()
+        for jid, j in list(jobs.items())
     }
+
+
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: str):
+    """Remove a job from memory. Only finished (completed/failed) jobs can be deleted."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] in ("queued", "downloading") or job["status"].startswith("retrying"):
+        raise HTTPException(status_code=409, detail="Job is still active")
+    jobs.pop(job_id, None)
+    return {"deleted": job_id}
 
 
 @app.get("/transcript")
@@ -338,42 +398,6 @@ def get_transcript(url: str, lang: str = "en"):
     }
 
 
-def _olevod_vv():
-    ts = str(int(time.time()))
-    bits = ['', '', '', '']
-    for char in ts:
-        encoded = format(ord(char), 'b')
-        bits[0] += encoded[2:3]
-        bits[1] += encoded[3:4]
-        bits[2] += encoded[4:5]
-        bits[3] += encoded[5:]
-    inserts = []
-    for part in bits:
-        value = format(int(part, 2), 'x') if part else ''
-        value = value.zfill(3)
-        inserts.append(value)
-    digest = hashlib.md5(ts.encode()).hexdigest()
-    return ''.join((
-        digest[:3], inserts[0], digest[6:11], inserts[1],
-        digest[14:19], inserts[2], digest[22:27], inserts[3], digest[30:],
-    ))
-
-
-def _olevod_decrypt(data: str):
-    if not isinstance(data, str):
-        return data
-    now = int(time.time())
-    for offset in (0, 86400, -86400):
-        date_str = time.strftime('%Y-%m-%d', time.localtime(now + offset))
-        key = hashlib.md5(date_str.encode()).hexdigest()[8:24].encode()
-        try:
-            decrypted = unpad_pkcs7(aes_cbc_decrypt_bytes(base64.b64decode(data), key, key)).decode()
-            return json_mod.loads(decrypted)
-        except Exception:
-            continue
-    return None
-
-
 OLEVOD_API = "https://api.olelive.com"
 OLEVOD_SITE = "https://www.olevod.com"
 
@@ -383,7 +407,7 @@ def search_olevod(q: str):
     headers = {"Origin": OLEVOD_SITE, "Referer": f"{OLEVOD_SITE}/"}
     resp = httpx.get(
         f"{OLEVOD_API}/v1/pub/index/search/{q}/0/0/0/1",
-        params={"_vv": _olevod_vv()},
+        params={"_vv": make_vv()},
         headers=headers,
         timeout=15,
     )
@@ -393,7 +417,7 @@ def search_olevod(q: str):
         return []
     data = body.get("data")
     if isinstance(data, str):
-        data = _olevod_decrypt(data)
+        data = decrypt_api_data(data)
     if not data:
         return []
     items = []

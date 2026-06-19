@@ -1,10 +1,5 @@
-import base64
-import hashlib
-import json
 import re
-import time
 
-from yt_dlp.aes import aes_cbc_decrypt_bytes, unpad_pkcs7
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import (
     ExtractorError,
@@ -16,6 +11,8 @@ from yt_dlp.utils import (
     url_or_none,
     urljoin,
 )
+
+from .olevod_common import decrypt_api_data, make_vv
 
 
 class OlevodIE(InfoExtractor):
@@ -66,32 +63,7 @@ class OlevodIE(InfoExtractor):
 
     @staticmethod
     def _make_vv(ts=None):
-        ts = str(int_or_none(ts) or int(time.time()))
-        bits = ['', '', '', '']
-        for char in ts:
-            encoded = format(ord(char), 'b')
-            bits[0] += encoded[2:3]
-            bits[1] += encoded[3:4]
-            bits[2] += encoded[4:5]
-            bits[3] += encoded[5:]
-        inserts = []
-        for part in bits:
-            value = format(int(part, 2), 'x') if part else ''
-            if len(value) == 2:
-                value = f'0{value}'
-            elif len(value) == 1:
-                value = f'00{value}'
-            elif len(value) == 0:
-                value = '000'
-            inserts.append(value)
-        digest = hashlib.md5(ts.encode()).hexdigest()
-        return ''.join((
-            digest[:3], inserts[0],
-            digest[6:11], inserts[1],
-            digest[14:19], inserts[2],
-            digest[22:27], inserts[3],
-            digest[30:],
-        ))
+        return make_vv(int_or_none(ts))
 
     @classmethod
     def _api_headers(cls, referer=None):
@@ -110,18 +82,10 @@ class OlevodIE(InfoExtractor):
         return None, None
 
     def _decrypt_api_data(self, data):
-        if not isinstance(data, str):
-            return data
-        now = int(time.time())
-        for offset in (0, 86400, -86400):
-            date_str = time.strftime('%Y-%m-%d', time.localtime(now + offset))
-            key = hashlib.md5(date_str.encode()).hexdigest()[8:24].encode()
-            try:
-                decrypted = unpad_pkcs7(aes_cbc_decrypt_bytes(base64.b64decode(data), key, key)).decode()
-                return json.loads(decrypted)
-            except Exception:
-                continue
-        raise ExtractorError('Unable to decrypt Olevod API response', expected=True)
+        result = decrypt_api_data(data)
+        if result is None:
+            raise ExtractorError('Unable to decrypt Olevod API response', expected=True)
+        return result
 
     def _extract_new_api_data(self, video_id, url):
         response = self._download_json(
